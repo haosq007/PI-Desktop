@@ -3,17 +3,21 @@
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readdirSync,
+  readSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_NAME = "PI-Desktop";
@@ -40,6 +44,62 @@ function resolveElectronInstallation() {
 
 function setPlistString(plistPath, key, value) {
   execFileSync("plutil", ["-replace", key, "-string", value, plistPath]);
+}
+
+const MACHO_MAGICS = new Set([
+  0xcafebabe, // universal, 32-bit offsets
+  0xcafebabf, // universal, 64-bit offsets
+  0xbebafeca, // universal, reversed byte order
+  0xbfbafeca,
+  0xfeedface, // 32-bit
+  0xfeedfacf, // 64-bit
+  0xcefaedfe, // 32-bit, reversed byte order
+  0xcffaedfe, // 64-bit, reversed byte order
+]);
+
+function isMachOFile(filePath) {
+  const descriptor = openSync(filePath, "r");
+  try {
+    const header = Buffer.alloc(4);
+    const bytesRead = readSync(descriptor, header, 0, header.length, 0);
+    return bytesRead === header.length && MACHO_MAGICS.has(header.readUInt32BE(0));
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function collectSigningTargets(bundlePath) {
+  const targets = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = join(directory, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (/\.(app|framework|xpc)$/.test(entry.name)) targets.push(entryPath);
+        walk(entryPath);
+      } else if (entry.isFile() && isMachOFile(entryPath)) {
+        targets.push(entryPath);
+      }
+    }
+  };
+  walk(bundlePath);
+  // codesign seals a bundle's nested code, so sign deepest targets first and
+  // leave the outer app bundle for last.
+  targets.sort((left, right) => right.split(sep).length - left.split(sep).length);
+  return targets;
+}
+
+export function signAdHocMacBundle({ bundlePath, identifier, runCommand = execFileSync }) {
+  // codesign rejects a bundle while nested code is unsigned, and `--deep`
+  // re-signing is unreliable on Electron frameworks, so sign every nested
+  // binary and bundle bottom-up before sealing the top-level bundle.
+  for (const target of collectSigningTargets(bundlePath)) {
+    runCommand("codesign", ["--force", "--sign", "-", target]);
+  }
+  const args = ["--force", "--sign", "-"];
+  if (identifier) args.push("--identifier", identifier);
+  args.push(bundlePath);
+  runCommand("codesign", args);
 }
 
 export function prepareMacDevelopmentBundle({
@@ -117,18 +177,10 @@ export function prepareMacDevelopmentBundle({
     setPlistString(plistPath, "CFBundleIconFile", "icon.icns");
 
     if (sign) {
-      // macOS no longer supports `codesign --deep` reliably on Electron
-      // app bundles (returns "bundle format is ambiguous" on frameworks).
-      // The bundled frameworks are already signed by Electron; we only
-      // need to re-sign the top-level app since we changed Info.plist.
-      execFileSync("codesign", [
-        "--force",
-        "--sign",
-        "-",
-        "--identifier",
-        DEV_BUNDLE_ID,
-        stagingBundle,
-      ]);
+      signAdHocMacBundle({
+        bundlePath: stagingBundle,
+        identifier: DEV_BUNDLE_ID,
+      });
     }
 
     writeFileSync(
